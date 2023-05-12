@@ -17,3 +17,4 @@ test-models/
 
 # just in case
 .DS_Store
+.history

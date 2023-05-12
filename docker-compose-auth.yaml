@@ -1,0 +1,26 @@
+version: '3.6'
+
+services:
+  api:
+    image: quay.io/go-skynet/local-ai:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+   # ports:
+     # - 8080:8080
+    env_file:
+      - .env
+    volumes:
+      - ./models:/models:cached
+    command: ["/usr/bin/local-ai" ]
+
+  #docker run --rm httpd htpasswd -nb user password > ./auth/htpasswd
+  nginx:
+      image: nginx:alpine
+      ports:
+        - 80:80
+      volumes:
+        - ./auth/nginx.conf:/etc/nginx/nginx.conf:ro
+        - ./auth/htpasswd:/etc/nginx/.htpasswd:ro
+      depends_on:
+        - api
