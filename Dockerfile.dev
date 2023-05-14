@@ -6,6 +6,8 @@ FROM golang:$GO_VERSION as builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y cmake
 COPY . .
+
+ENV GOPROXY="https://goproxy.cn,https://proxy.golang.org,direct"
 RUN make build
 
 FROM debian:$DEBIAN_VERSION
