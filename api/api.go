@@ -3,7 +3,6 @@ package api
 import (
 	"errors"
 
-	model "github.com/go-skynet/LocalAI/pkg/model"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
@@ -12,16 +11,18 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-func App(configFile string, loader *model.ModelLoader, uploadLimitMB, threads, ctxSize int, f16 bool, debug, disableMessage bool) *fiber.App {
+func App(opts ...AppOption) *fiber.App {
+	options := newOptions(opts...)
+
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	if debug {
+	if options.debug {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
 
 	// Return errors as JSON responses
 	app := fiber.New(fiber.Config{
-		BodyLimit:             uploadLimitMB * 1024 * 1024, // this is the default limit of 4MB
-		DisableStartupMessage: disableMessage,
+		BodyLimit:             options.uploadLimitMB * 1024 * 1024, // this is the default limit of 4MB
+		DisableStartupMessage: options.disableMessage,
 		// Override default error handler
 		ErrorHandler: func(ctx *fiber.Ctx, err error) error {
 			// Status code defaults to 500
@@ -42,53 +43,80 @@ func App(configFile string, loader *model.ModelLoader, uploadLimitMB, threads, c
 		},
 	})
 
-	if debug {
+	if options.debug {
 		app.Use(logger.New(logger.Config{
 			Format: "[${ip}]:${port} ${status} - ${method} ${path}\n",
 		}))
 	}
 
-	cm := make(ConfigMerger)
-	if err := cm.LoadConfigs(loader.ModelPath); err != nil {
+	cm := NewConfigMerger()
+	if err := cm.LoadConfigs(options.loader.ModelPath); err != nil {
 		log.Error().Msgf("error loading config files: %s", err.Error())
 	}
 
-	if configFile != "" {
-		if err := cm.LoadConfigFile(configFile); err != nil {
+	if options.configFile != "" {
+		if err := cm.LoadConfigFile(options.configFile); err != nil {
 			log.Error().Msgf("error loading config file: %s", err.Error())
 		}
 	}
 
-	if debug {
-		for k, v := range cm {
-			log.Debug().Msgf("Model: %s (config: %+v)", k, v)
+	if options.debug {
+		for _, v := range cm.ListConfigs() {
+			cfg, _ := cm.GetConfig(v)
+			log.Debug().Msgf("Model: %s (config: %+v)", v, cfg)
 		}
 	}
 	// Default middleware config
 	app.Use(recover.New())
-	app.Use(cors.New())
+
+	if options.cors {
+		if options.corsAllowOrigins == "" {
+			app.Use(cors.New())
+		} else {
+			app.Use(cors.New(cors.Config{
+				AllowOrigins: options.corsAllowOrigins,
+			}))
+		}
+	}
+
+	// LocalAI API endpoints
+	applier := newGalleryApplier(options.loader.ModelPath)
+	applier.start(options.context, cm)
+	app.Post("/models/apply", applyModelGallery(options.loader.ModelPath, cm, applier.C))
+	app.Get("/models/jobs/:uuid", getOpStatus(applier))
 
 	// openAI compatible API endpoint
-	app.Post("/v1/chat/completions", chatEndpoint(cm, debug, loader, threads, ctxSize, f16))
-	app.Post("/chat/completions", chatEndpoint(cm, debug, loader, threads, ctxSize, f16))
 
-	app.Post("/v1/edits", editEndpoint(cm, debug, loader, threads, ctxSize, f16))
-	app.Post("/edits", editEndpoint(cm, debug, loader, threads, ctxSize, f16))
+	// chat
+	app.Post("/v1/chat/completions", chatEndpoint(cm, options))
+	app.Post("/chat/completions", chatEndpoint(cm, options))
 
-	app.Post("/v1/completions", completionEndpoint(cm, debug, loader, threads, ctxSize, f16))
-	app.Post("/completions", completionEndpoint(cm, debug, loader, threads, ctxSize, f16))
+	// edit
+	app.Post("/v1/edits", editEndpoint(cm, options))
+	app.Post("/edits", editEndpoint(cm, options))
 
-	app.Post("/v1/embeddings", embeddingsEndpoint(cm, debug, loader, threads, ctxSize, f16))
-	app.Post("/embeddings", embeddingsEndpoint(cm, debug, loader, threads, ctxSize, f16))
+	// completion
+	app.Post("/v1/completions", completionEndpoint(cm, options))
+	app.Post("/completions", completionEndpoint(cm, options))
 
-	// /v1/engines/{engine_id}/embeddings
+	// embeddings
+	app.Post("/v1/embeddings", embeddingsEndpoint(cm, options))
+	app.Post("/embeddings", embeddingsEndpoint(cm, options))
+	app.Post("/v1/engines/:model/embeddings", embeddingsEndpoint(cm, options))
 
-	app.Post("/v1/engines/:model/embeddings", embeddingsEndpoint(cm, debug, loader, threads, ctxSize, f16))
+	// audio
+	app.Post("/v1/audio/transcriptions", transcriptEndpoint(cm, options))
 
-	app.Post("/v1/audio/transcriptions", transcriptEndpoint(cm, debug, loader, threads, ctxSize, f16))
+	// images
+	app.Post("/v1/images/generations", imageEndpoint(cm, options))
 
-	app.Get("/v1/models", listModels(loader, cm))
-	app.Get("/models", listModels(loader, cm))
+	if options.imageDir != "" {
+		app.Static("/generated-images", options.imageDir)
+	}
+
+	// models
+	app.Get("/v1/models", listModels(options.loader, cm))
+	app.Get("/models", listModels(options.loader, cm))
 
 	return app
 }

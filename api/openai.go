@@ -3,13 +3,16 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/ggerganov/whisper.cpp/bindings/go/pkg/whisper"
@@ -43,6 +46,10 @@ type Item struct {
 	Embedding []float32 `json:"embedding"`
 	Index     int       `json:"index"`
 	Object    string    `json:"object,omitempty"`
+
+	// Images
+	URL     string `json:"url,omitempty"`
+	B64JSON string `json:"b64_json,omitempty"`
 }
 
 type OpenAIResponse struct {
@@ -78,11 +85,13 @@ type OpenAIRequest struct {
 	Model string `json:"model" yaml:"model"`
 
 	// whisper
-	File           string `json:"file" validate:"required"`
+	File     string `json:"file" validate:"required"`
+	Language string `json:"language"`
+	//whisper/image
 	ResponseFormat string `json:"response_format"`
-	Language       string `json:"language"`
-
-	// Prompt is read only by completion API calls
+	// image
+	Size string `json:"size"`
+	// Prompt is read only by completion/image API calls
 	Prompt interface{} `json:"prompt" yaml:"prompt"`
 
 	// Edit endpoint
@@ -116,6 +125,10 @@ type OpenAIRequest struct {
 	Mirostat    int     `json:"mirostat" yaml:"mirostat"`
 
 	Seed int `json:"seed" yaml:"seed"`
+
+	// Image (not supported by OpenAI)
+	Mode int `json:"mode"`
+	Step int `json:"step"`
 }
 
 func defaultRequest(modelFile string) OpenAIRequest {
@@ -129,9 +142,15 @@ func defaultRequest(modelFile string) OpenAIRequest {
 }
 
 // https://platform.openai.com/docs/api-reference/completions
-func completionEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, threads, ctx int, f16 bool) func(c *fiber.Ctx) error {
+func completionEndpoint(cm *ConfigMerger, o *Option) func(c *fiber.Ctx) error {
 	return func(c *fiber.Ctx) error {
-		config, input, err := readConfig(cm, c, loader, debug, threads, ctx, f16)
+
+		model, input, err := readInput(c, o.loader, true)
+		if err != nil {
+			return fmt.Errorf("failed reading parameters from request:%w", err)
+		}
+
+		config, input, err := readConfig(model, input, cm, o.loader, o.debug, o.threads, o.ctxSize, o.f16)
 		if err != nil {
 			return fmt.Errorf("failed reading parameters from request:%w", err)
 		}
@@ -147,7 +166,7 @@ func completionEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, 
 		var result []Choice
 		for _, i := range config.PromptStrings {
 			// A model can have a "file.bin.tmpl" file associated with a prompt template prefix
-			templatedInput, err := loader.TemplatePrefix(templateFile, struct {
+			templatedInput, err := o.loader.TemplatePrefix(templateFile, struct {
 				Input string
 			}{Input: i})
 			if err == nil {
@@ -155,7 +174,7 @@ func completionEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, 
 				log.Debug().Msgf("Template found, input modified to: %s", i)
 			}
 
-			r, err := ComputeChoices(i, input, config, loader, func(s string, c *[]Choice) {
+			r, err := ComputeChoices(i, input, config, o.loader, func(s string, c *[]Choice) {
 				*c = append(*c, Choice{Text: s})
 			}, nil)
 			if err != nil {
@@ -180,9 +199,14 @@ func completionEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, 
 }
 
 // https://platform.openai.com/docs/api-reference/embeddings
-func embeddingsEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, threads, ctx int, f16 bool) func(c *fiber.Ctx) error {
+func embeddingsEndpoint(cm *ConfigMerger, o *Option) func(c *fiber.Ctx) error {
 	return func(c *fiber.Ctx) error {
-		config, input, err := readConfig(cm, c, loader, debug, threads, ctx, f16)
+		model, input, err := readInput(c, o.loader, true)
+		if err != nil {
+			return fmt.Errorf("failed reading parameters from request:%w", err)
+		}
+
+		config, input, err := readConfig(model, input, cm, o.loader, o.debug, o.threads, o.ctxSize, o.f16)
 		if err != nil {
 			return fmt.Errorf("failed reading parameters from request:%w", err)
 		}
@@ -192,7 +216,7 @@ func embeddingsEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, 
 
 		for i, s := range config.InputToken {
 			// get the model function to call for the result
-			embedFn, err := ModelEmbedding("", s, loader, *config)
+			embedFn, err := ModelEmbedding("", s, o.loader, *config)
 			if err != nil {
 				return err
 			}
@@ -206,7 +230,7 @@ func embeddingsEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, 
 
 		for i, s := range config.InputStrings {
 			// get the model function to call for the result
-			embedFn, err := ModelEmbedding(s, []int{}, loader, *config)
+			embedFn, err := ModelEmbedding(s, []int{}, o.loader, *config)
 			if err != nil {
 				return err
 			}
@@ -232,13 +256,20 @@ func embeddingsEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, 
 	}
 }
 
-func chatEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, threads, ctx int, f16 bool) func(c *fiber.Ctx) error {
+func chatEndpoint(cm *ConfigMerger, o *Option) func(c *fiber.Ctx) error {
 
 	process := func(s string, req *OpenAIRequest, config *Config, loader *model.ModelLoader, responses chan OpenAIResponse) {
+		initialMessage := OpenAIResponse{
+			Model:   req.Model, // we have to return what the user sent here, due to OpenAI spec.
+			Choices: []Choice{{Delta: &Message{Role: "assistant"}}},
+			Object:  "chat.completion.chunk",
+		}
+		responses <- initialMessage
+
 		ComputeChoices(s, req, config, loader, func(s string, c *[]Choice) {}, func(s string) bool {
 			resp := OpenAIResponse{
 				Model:   req.Model, // we have to return what the user sent here, due to OpenAI spec.
-				Choices: []Choice{{Delta: &Message{Role: "assistant", Content: s}}},
+				Choices: []Choice{{Delta: &Message{Content: s}}},
 				Object:  "chat.completion.chunk",
 			}
 			log.Debug().Msgf("Sending goroutine: %s", s)
@@ -249,7 +280,12 @@ func chatEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, thread
 		close(responses)
 	}
 	return func(c *fiber.Ctx) error {
-		config, input, err := readConfig(cm, c, loader, debug, threads, ctx, f16)
+		model, input, err := readInput(c, o.loader, true)
+		if err != nil {
+			return fmt.Errorf("failed reading parameters from request:%w", err)
+		}
+
+		config, input, err := readConfig(model, input, cm, o.loader, o.debug, o.threads, o.ctxSize, o.f16)
 		if err != nil {
 			return fmt.Errorf("failed reading parameters from request:%w", err)
 		}
@@ -260,12 +296,14 @@ func chatEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, thread
 
 		mess := []string{}
 		for _, i := range input.Messages {
+			var content string
 			r := config.Roles[i.Role]
-			if r == "" {
-				r = i.Role
+			if r != "" {
+				content = fmt.Sprint(r, " ", i.Content)
+			} else {
+				content = i.Content
 			}
 
-			content := fmt.Sprint(r, " ", i.Content)
 			mess = append(mess, content)
 		}
 
@@ -288,7 +326,7 @@ func chatEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, thread
 		}
 
 		// A model can have a "file.bin.tmpl" file associated with a prompt template prefix
-		templatedInput, err := loader.TemplatePrefix(templateFile, struct {
+		templatedInput, err := o.loader.TemplatePrefix(templateFile, struct {
 			Input string
 		}{Input: predInput})
 		if err == nil {
@@ -299,7 +337,7 @@ func chatEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, thread
 		if input.Stream {
 			responses := make(chan OpenAIResponse)
 
-			go process(predInput, input, config, loader, responses)
+			go process(predInput, input, config, o.loader, responses)
 
 			c.Context().SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
 
@@ -308,13 +346,11 @@ func chatEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, thread
 					enc := json.NewEncoder(&buf)
 					enc.Encode(ev)
 
-					fmt.Fprintf(w, "event: data\n\n")
-					fmt.Fprintf(w, "data: %v\n\n", buf.String())
 					log.Debug().Msgf("Sending chunk: %s", buf.String())
+					fmt.Fprintf(w, "data: %v\n", buf.String())
 					w.Flush()
 				}
 
-				w.WriteString("event: data\n\n")
 				resp := &OpenAIResponse{
 					Model:   input.Model, // we have to return what the user sent here, due to OpenAI spec.
 					Choices: []Choice{{FinishReason: "stop"}},
@@ -322,12 +358,13 @@ func chatEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, thread
 				respData, _ := json.Marshal(resp)
 
 				w.WriteString(fmt.Sprintf("data: %s\n\n", respData))
+				w.WriteString("data: [DONE]\n\n")
 				w.Flush()
 			}))
 			return nil
 		}
 
-		result, err := ComputeChoices(predInput, input, config, loader, func(s string, c *[]Choice) {
+		result, err := ComputeChoices(predInput, input, config, o.loader, func(s string, c *[]Choice) {
 			*c = append(*c, Choice{Message: &Message{Role: "assistant", Content: s}})
 		}, nil)
 		if err != nil {
@@ -347,9 +384,14 @@ func chatEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, thread
 	}
 }
 
-func editEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, threads, ctx int, f16 bool) func(c *fiber.Ctx) error {
+func editEndpoint(cm *ConfigMerger, o *Option) func(c *fiber.Ctx) error {
 	return func(c *fiber.Ctx) error {
-		config, input, err := readConfig(cm, c, loader, debug, threads, ctx, f16)
+		model, input, err := readInput(c, o.loader, true)
+		if err != nil {
+			return fmt.Errorf("failed reading parameters from request:%w", err)
+		}
+
+		config, input, err := readConfig(model, input, cm, o.loader, o.debug, o.threads, o.ctxSize, o.f16)
 		if err != nil {
 			return fmt.Errorf("failed reading parameters from request:%w", err)
 		}
@@ -365,7 +407,7 @@ func editEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, thread
 		var result []Choice
 		for _, i := range config.InputStrings {
 			// A model can have a "file.bin.tmpl" file associated with a prompt template prefix
-			templatedInput, err := loader.TemplatePrefix(templateFile, struct {
+			templatedInput, err := o.loader.TemplatePrefix(templateFile, struct {
 				Input       string
 				Instruction string
 			}{Input: i})
@@ -374,7 +416,7 @@ func editEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, thread
 				log.Debug().Msgf("Template found, input modified to: %s", i)
 			}
 
-			r, err := ComputeChoices(i, input, config, loader, func(s string, c *[]Choice) {
+			r, err := ComputeChoices(i, input, config, o.loader, func(s string, c *[]Choice) {
 				*c = append(*c, Choice{Text: s})
 			}, nil)
 			if err != nil {
@@ -398,14 +440,157 @@ func editEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, thread
 	}
 }
 
-// https://platform.openai.com/docs/api-reference/audio/create
-func transcriptEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, threads, ctx int, f16 bool) func(c *fiber.Ctx) error {
+// https://platform.openai.com/docs/api-reference/images/create
+
+/*
+*
+
+	curl http://localhost:8080/v1/images/generations \
+	  -H "Content-Type: application/json" \
+	  -d '{
+	    "prompt": "A cute baby sea otter",
+	    "n": 1,
+	    "size": "512x512"
+	  }'
+
+*
+*/
+func imageEndpoint(cm *ConfigMerger, o *Option) func(c *fiber.Ctx) error {
 	return func(c *fiber.Ctx) error {
-		config, input, err := readConfig(cm, c, loader, debug, threads, ctx, f16)
+		m, input, err := readInput(c, o.loader, false)
 		if err != nil {
 			return fmt.Errorf("failed reading parameters from request:%w", err)
 		}
 
+		if m == "" {
+			m = model.StableDiffusionBackend
+		}
+		log.Debug().Msgf("Loading model: %+v", m)
+
+		config, input, err := readConfig(m, input, cm, o.loader, o.debug, 0, 0, false)
+		if err != nil {
+			return fmt.Errorf("failed reading parameters from request:%w", err)
+		}
+
+		log.Debug().Msgf("Parameter Config: %+v", config)
+
+		// XXX: Only stablediffusion is supported for now
+		if config.Backend == "" {
+			config.Backend = model.StableDiffusionBackend
+		}
+
+		sizeParts := strings.Split(input.Size, "x")
+		if len(sizeParts) != 2 {
+			return fmt.Errorf("Invalid value for 'size'")
+		}
+		width, err := strconv.Atoi(sizeParts[0])
+		if err != nil {
+			return fmt.Errorf("Invalid value for 'size'")
+		}
+		height, err := strconv.Atoi(sizeParts[1])
+		if err != nil {
+			return fmt.Errorf("Invalid value for 'size'")
+		}
+
+		b64JSON := false
+		if input.ResponseFormat == "b64_json" {
+			b64JSON = true
+		}
+
+		var result []Item
+		for _, i := range config.PromptStrings {
+			n := input.N
+			if input.N == 0 {
+				n = 1
+			}
+			for j := 0; j < n; j++ {
+				prompts := strings.Split(i, "|")
+				positive_prompt := prompts[0]
+				negative_prompt := ""
+				if len(prompts) > 1 {
+					negative_prompt = prompts[1]
+				}
+
+				mode := 0
+				step := 15
+
+				if input.Mode != 0 {
+					mode = input.Mode
+				}
+
+				if input.Step != 0 {
+					step = input.Step
+				}
+
+				tempDir := ""
+				if !b64JSON {
+					tempDir = o.imageDir
+				}
+				// Create a temporary file
+				outputFile, err := ioutil.TempFile(tempDir, "b64")
+				if err != nil {
+					return err
+				}
+				outputFile.Close()
+				output := outputFile.Name() + ".png"
+				// Rename the temporary file
+				err = os.Rename(outputFile.Name(), output)
+				if err != nil {
+					return err
+				}
+
+				baseURL := c.BaseURL()
+
+				fn, err := ImageGeneration(height, width, mode, step, input.Seed, positive_prompt, negative_prompt, output, o.loader, *config)
+				if err != nil {
+					return err
+				}
+				if err := fn(); err != nil {
+					return err
+				}
+
+				item := &Item{}
+
+				if b64JSON {
+					defer os.RemoveAll(output)
+					data, err := os.ReadFile(output)
+					if err != nil {
+						return err
+					}
+					item.B64JSON = base64.StdEncoding.EncodeToString(data)
+				} else {
+					base := filepath.Base(output)
+					item.URL = baseURL + "/generated-images/" + base
+				}
+
+				result = append(result, *item)
+			}
+		}
+
+		resp := &OpenAIResponse{
+			Data: result,
+		}
+
+		jsonResult, _ := json.Marshal(resp)
+		log.Debug().Msgf("Response: %s", jsonResult)
+
+		// Return the prediction in the response body
+		return c.JSON(resp)
+	}
+}
+
+// https://platform.openai.com/docs/api-reference/audio/create
+func transcriptEndpoint(cm *ConfigMerger, o *Option) func(c *fiber.Ctx) error {
+	return func(c *fiber.Ctx) error {
+		m, input, err := readInput(c, o.loader, false)
+		if err != nil {
+			return fmt.Errorf("failed reading parameters from request:%w", err)
+		}
+
+		config, input, err := readConfig(m, input, cm, o.loader, o.debug, o.threads, o.ctxSize, o.f16)
+		if err != nil {
+			return fmt.Errorf("failed reading parameters from request:%w", err)
+		}
 		// retrieve the file data from the request
 		file, err := c.FormFile("file")
 		if err != nil {
@@ -437,7 +622,7 @@ func transcriptEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, 
 
 		log.Debug().Msgf("Audio file copied to: %+v", dst)
 
-		whisperModel, err := loader.BackendLoader(model.WhisperBackend, config.Model, []llama.ModelOption{}, uint32(config.Threads))
+		whisperModel, err := o.loader.BackendLoader(model.WhisperBackend, config.Model, []llama.ModelOption{}, uint32(config.Threads))
 		if err != nil {
 			return err
 		}
@@ -462,7 +647,7 @@ func transcriptEndpoint(cm ConfigMerger, debug bool, loader *model.ModelLoader, 
 	}
 }
 
-func listModels(loader *model.ModelLoader, cm ConfigMerger) func(ctx *fiber.Ctx) error {
+func listModels(loader *model.ModelLoader, cm *ConfigMerger) func(ctx *fiber.Ctx) error {
 	return func(c *fiber.Ctx) error {
 		models, err := loader.ListModels()
 		if err != nil {
@@ -476,7 +661,7 @@ func listModels(loader *model.ModelLoader, cm ConfigMerger) func(ctx *fiber.Ctx)
 			dataModels = append(dataModels, OpenAIModel{ID: m, Object: "model"})
 		}
 
-		for k := range cm {
+		for _, k := range cm.ListConfigs() {
 			if _, exists := mm[k]; !exists {
 				dataModels = append(dataModels, OpenAIModel{ID: k, Object: "model"})
 			}

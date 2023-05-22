@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	model "github.com/go-skynet/LocalAI/pkg/model"
 	"github.com/gofiber/fiber/v2"
@@ -15,23 +16,24 @@ import (
 )
 
 type Config struct {
-	OpenAIRequest  `yaml:"parameters"`
-	Name           string            `yaml:"name"`
-	StopWords      []string          `yaml:"stopwords"`
-	Cutstrings     []string          `yaml:"cutstrings"`
-	TrimSpace      []string          `yaml:"trimspace"`
-	ContextSize    int               `yaml:"context_size"`
-	F16            bool              `yaml:"f16"`
-	Threads        int               `yaml:"threads"`
-	Debug          bool              `yaml:"debug"`
-	Roles          map[string]string `yaml:"roles"`
-	Embeddings     bool              `yaml:"embeddings"`
-	Backend        string            `yaml:"backend"`
-	TemplateConfig TemplateConfig    `yaml:"template"`
-	MirostatETA    float64           `yaml:"mirostat_eta"`
-	MirostatTAU    float64           `yaml:"mirostat_tau"`
-	Mirostat       int               `yaml:"mirostat"`
-
+	OpenAIRequest               `yaml:"parameters"`
+	Name                        string            `yaml:"name"`
+	StopWords                   []string          `yaml:"stopwords"`
+	Cutstrings                  []string          `yaml:"cutstrings"`
+	TrimSpace                   []string          `yaml:"trimspace"`
+	ContextSize                 int               `yaml:"context_size"`
+	F16                         bool              `yaml:"f16"`
+	Threads                     int               `yaml:"threads"`
+	Debug                       bool              `yaml:"debug"`
+	Roles                       map[string]string `yaml:"roles"`
+	Embeddings                  bool              `yaml:"embeddings"`
+	Backend                     string            `yaml:"backend"`
+	TemplateConfig              TemplateConfig    `yaml:"template"`
+	MirostatETA                 float64           `yaml:"mirostat_eta"`
+	MirostatTAU                 float64           `yaml:"mirostat_tau"`
+	Mirostat                    int               `yaml:"mirostat"`
+	NGPULayers                  int               `yaml:"gpu_layers"`
+	ImageGenerationAssets       string            `yaml:"asset_dir"`
 	PromptStrings, InputStrings []string
 	InputToken                  [][]int
 }
@@ -42,8 +44,16 @@ type TemplateConfig struct {
 	Edit       string `yaml:"edit"`
 }
 
-type ConfigMerger map[string]Config
+type ConfigMerger struct {
+	configs map[string]Config
+	sync.Mutex
+}
 
+func NewConfigMerger() *ConfigMerger {
+	return &ConfigMerger{
+		configs: make(map[string]Config),
+	}
+}
 func ReadConfigFile(file string) ([]*Config, error) {
 	c := &[]*Config{}
 	f, err := os.ReadFile(file)
@@ -71,28 +81,51 @@ func ReadConfig(file string) (*Config, error) {
 }
 
 func (cm ConfigMerger) LoadConfigFile(file string) error {
+	cm.Lock()
+	defer cm.Unlock()
 	c, err := ReadConfigFile(file)
 	if err != nil {
 		return fmt.Errorf("cannot load config file: %w", err)
 	}
 
 	for _, cc := range c {
-		cm[cc.Name] = *cc
+		cm.configs[cc.Name] = *cc
 	}
 	return nil
 }
 
 func (cm ConfigMerger) LoadConfig(file string) error {
+	cm.Lock()
+	defer cm.Unlock()
 	c, err := ReadConfig(file)
 	if err != nil {
 		return fmt.Errorf("cannot read config file: %w", err)
 	}
 
-	cm[c.Name] = *c
+	cm.configs[c.Name] = *c
 	return nil
 }
 
+func (cm ConfigMerger) GetConfig(m string) (Config, bool) {
+	cm.Lock()
+	defer cm.Unlock()
+	v, exists := cm.configs[m]
+	return v, exists
+}
+
+func (cm ConfigMerger) ListConfigs() []string {
+	cm.Lock()
+	defer cm.Unlock()
+	var res []string
+	for k := range cm.configs {
+		res = append(res, k)
+	}
+	return res
+}
+
 func (cm ConfigMerger) LoadConfigs(path string) error {
+	cm.Lock()
+	defer cm.Unlock()
 	files, err := ioutil.ReadDir(path)
 	if err != nil {
 		return err
@@ -105,7 +138,7 @@ func (cm ConfigMerger) LoadConfigs(path string) error {
 		}
 		c, err := ReadConfig(filepath.Join(path, file.Name()))
 		if err == nil {
-			cm[c.Name] = *c
+			cm.configs[c.Name] = *c
 		}
 	}
 
@@ -211,12 +244,11 @@ func updateConfig(config *Config, input *OpenAIRequest) {
 		}
 	}
 }
-
-func readConfig(cm ConfigMerger, c *fiber.Ctx, loader *model.ModelLoader, debug bool, threads, ctx int, f16 bool) (*Config, *OpenAIRequest, error) {
+func readInput(c *fiber.Ctx, loader *model.ModelLoader, randomModel bool) (string, *OpenAIRequest, error) {
 	input := new(OpenAIRequest)
 	// Get input data from the request body
 	if err := c.BodyParser(input); err != nil {
-		return nil, nil, err
+		return "", nil, err
 	}
 
 	modelFile := input.Model
@@ -234,14 +266,14 @@ func readConfig(cm ConfigMerger, c *fiber.Ctx, loader *model.ModelLoader, debug 
 	bearerExists := bearer != "" && loader.ExistsInModelPath(bearer)
 
 	// If no model was specified, take the first available
-	if modelFile == "" && !bearerExists {
+	if modelFile == "" && !bearerExists && randomModel {
 		models, _ := loader.ListModels()
 		if len(models) > 0 {
 			modelFile = models[0]
 			log.Debug().Msgf("No model specified, using: %s", modelFile)
 		} else {
 			log.Debug().Msgf("No model specified, returning error")
-			return nil, nil, fmt.Errorf("no model specified")
+			return "", nil, fmt.Errorf("no model specified")
 		}
 	}
 
@@ -250,7 +282,10 @@ func readConfig(cm ConfigMerger, c *fiber.Ctx, loader *model.ModelLoader, debug 
 		log.Debug().Msgf("Using model from bearer token: %s", bearer)
 		modelFile = bearer
 	}
+	return modelFile, input, nil
+}
 
+func readConfig(modelFile string, input *OpenAIRequest, cm *ConfigMerger, loader *model.ModelLoader, debug bool, threads, ctx int, f16 bool) (*Config, *OpenAIRequest, error) {
 	// Load a config file if present after the model name
 	modelConfig := filepath.Join(loader.ModelPath, modelFile+".yaml")
 	if _, err := os.Stat(modelConfig); err == nil {
@@ -260,7 +295,7 @@ func readConfig(cm ConfigMerger, c *fiber.Ctx, loader *model.ModelLoader, debug 
 	}
 
 	var config *Config
-	cfg, exists := cm[modelFile]
+	cfg, exists := cm.GetConfig(modelFile)
 	if !exists {
 		config = &Config{
 			OpenAIRequest: defaultRequest(modelFile),

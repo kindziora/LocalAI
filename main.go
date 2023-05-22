@@ -33,6 +33,14 @@ func main() {
 				Name:    "debug",
 				EnvVars: []string{"DEBUG"},
 			},
+			&cli.BoolFlag{
+				Name:    "cors",
+				EnvVars: []string{"CORS"},
+			},
+			&cli.StringFlag{
+				Name:    "cors-allow-origins",
+				EnvVars: []string{"CORS_ALLOW_ORIGINS"},
+			},
 			&cli.IntFlag{
 				Name:        "threads",
 				DefaultText: "Number of threads used for parallel computation. Usage of the number of physical cores in the system is suggested.",
@@ -55,6 +63,12 @@ func main() {
 				DefaultText: "Bind address for the API server.",
 				EnvVars:     []string{"ADDRESS"},
 				Value:       ":8080",
+			},
+			&cli.StringFlag{
+				Name:        "image-path",
+				DefaultText: "Image directory",
+				EnvVars:     []string{"IMAGE_PATH"},
+				Value:       "",
 			},
 			&cli.IntFlag{
 				Name:        "context-size",
@@ -87,7 +101,17 @@ It uses llama.cpp, ggml and gpt4all as backend with golang c bindings.
 		Copyright: "go-skynet authors",
 		Action: func(ctx *cli.Context) error {
 			fmt.Printf("Starting LocalAI using %d threads, with models path: %s\n", ctx.Int("threads"), ctx.String("models-path"))
-			return api.App(ctx.String("config-file"), model.NewModelLoader(ctx.String("models-path")), ctx.Int("upload-limit"), ctx.Int("threads"), ctx.Int("context-size"), ctx.Bool("f16"), ctx.Bool("debug"), false).Listen(ctx.String("address"))
+			return api.App(
+				api.WithConfigFile(ctx.String("config-file")),
+				api.WithModelLoader(model.NewModelLoader(ctx.String("models-path"))),
+				api.WithContextSize(ctx.Int("context-size")),
+				api.WithDebug(ctx.Bool("debug")),
+				api.WithImageDir(ctx.String("image-path")),
+				api.WithF16(ctx.Bool("f16")),
+				api.WithCors(ctx.Bool("cors")),
+				api.WithCorsAllowOrigins(ctx.String("cors-allow-origins")),
+				api.WithThreads(ctx.Int("threads")),
+				api.WithUploadLimitMB(ctx.Int("upload-limit"))).Listen(ctx.String("address"))
 		},
 	}
 

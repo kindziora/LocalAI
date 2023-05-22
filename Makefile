@@ -3,16 +3,22 @@ GOTEST=$(GOCMD) test
 GOVET=$(GOCMD) vet
 BINARY_NAME=local-ai
 
-GOLLAMA_VERSION?=eb99b5438787cbd687682da445e879e02bfeaa07
-GPT4ALL_REPO?=https://github.com/go-skynet/gpt4all
-GPT4ALL_VERSION?=a330bfe26e9e35ca402e16df18973a3b162fb4db
-GOGPT2_VERSION?=92421a8cf61ed6e03babd9067af292b094cb1307
+GOLLAMA_VERSION?=ccf23adfb278c0165d388389a5d60f3fe38e4854
+GPT4ALL_REPO?=https://github.com/nomic-ai/gpt4all
+GPT4ALL_VERSION?=c8c95ab46f922f7efaa241f14d9c56086aa4ab98
+GOGPT2_VERSION?=7bff56f0224502c1c9ed6258d2a17e8084628827
 RWKV_REPO?=https://github.com/donomii/go-rwkv.cpp
 RWKV_VERSION?=07166da10cb2a9e8854395a4f210464dcea76e47
-WHISPER_CPP_VERSION?=1d17cd5bb37a3212679d6055ad69ba5a8d58eb71
-BERT_VERSION?=33118e0da50318101408986b86a331daeb4a6658
+WHISPER_CPP_VERSION?=041be06d5881d3c759cc4ed45d655804361237cd
+BERT_VERSION?=cea1ed76a7f48ef386a8e369f6c82c48cdf2d551
 BLOOMZ_VERSION?=e9366e82abdfe70565644fbfae9651976714efd1
+BUILD_TYPE?=
+CGO_LDFLAGS?=
+CUDA_LIBPATH?=/usr/local/cuda/lib64/
+STABLEDIFFUSION_VERSION?=c0748eca3642d58bcf9521108bcee46959c647dc
+GO_TAGS?=
 
+OPTIONAL_TARGETS?=
 
 GREEN  := $(shell tput -Txterm setaf 2)
 YELLOW := $(shell tput -Txterm setaf 3)
@@ -20,18 +26,20 @@ WHITE  := $(shell tput -Txterm setaf 7)
 CYAN   := $(shell tput -Txterm setaf 6)
 RESET  := $(shell tput -Txterm sgr0)
 
-C_INCLUDE_PATH=$(shell pwd)/go-llama:$(shell pwd)/gpt4all/gpt4all-bindings/golang/:$(shell pwd)/go-gpt2:$(shell pwd)/go-rwkv:$(shell pwd)/whisper.cpp:$(shell pwd)/go-bert:$(shell pwd)/bloomz
-LIBRARY_PATH=$(shell pwd)/go-llama:$(shell pwd)/gpt4all/gpt4all-bindings/golang/:$(shell pwd)/go-gpt2:$(shell pwd)/go-rwkv:$(shell pwd)/whisper.cpp:$(shell pwd)/go-bert:$(shell pwd)/bloomz
+C_INCLUDE_PATH=$(shell pwd)/go-llama:$(shell pwd)/go-stable-diffusion/:$(shell pwd)/gpt4all/gpt4all-bindings/golang/:$(shell pwd)/go-gpt2:$(shell pwd)/go-rwkv:$(shell pwd)/whisper.cpp:$(shell pwd)/go-bert:$(shell pwd)/bloomz
+LIBRARY_PATH=$(shell pwd)/go-llama:$(shell pwd)/go-stable-diffusion/:$(shell pwd)/gpt4all/gpt4all-bindings/golang/:$(shell pwd)/go-gpt2:$(shell pwd)/go-rwkv:$(shell pwd)/whisper.cpp:$(shell pwd)/go-bert:$(shell pwd)/bloomz
 
-# Use this if you want to set the default behavior
-ifndef BUILD_TYPE
-	BUILD_TYPE:=default
+ifeq ($(BUILD_TYPE),openblas)
+	CGO_LDFLAGS+=-lopenblas
 endif
 
-ifeq ($(BUILD_TYPE), "generic")
-	GENERIC_PREFIX:=generic-
-else
-	GENERIC_PREFIX:=
+ifeq ($(BUILD_TYPE),cublas)
+	CGO_LDFLAGS+=-lcublas -lcudart -L$(CUDA_LIBPATH)
+	export LLAMA_CUBLAS=1
+endif
+
+ifeq ($(GO_TAGS),stablediffusion)
+	OPTIONAL_TARGETS+=go-stable-diffusion/libstablediffusion.a
 endif
 
 .PHONY: all test build vendor
@@ -57,6 +65,7 @@ gpt4all:
 	@find ./gpt4all -type f -name "*.cpp" -exec sed -i'' -e 's/json_/json_gptj_/g' {} +
 	@find ./gpt4all -type f -name "*.cpp" -exec sed -i'' -e 's/void replace/void json_gptj_replace/g' {} +
 	@find ./gpt4all -type f -name "*.cpp" -exec sed -i'' -e 's/::replace/::json_gptj_replace/g' {} +
+	@find ./gpt4all -type f -name "*.cpp" -exec sed -i'' -e 's/regex_escape/gpt4allregex_escape/g' {} +
 	mv ./gpt4all/gpt4all-backend/llama.cpp/llama_util.h ./gpt4all/gpt4all-backend/llama.cpp/gptjllama_util.h
 
 ## BERT embeddings
@@ -66,6 +75,14 @@ go-bert:
 	@find ./go-bert -type f -name "*.c" -exec sed -i'' -e 's/ggml_/ggml_bert_/g' {} +
 	@find ./go-bert -type f -name "*.cpp" -exec sed -i'' -e 's/ggml_/ggml_bert_/g' {} +
 	@find ./go-bert -type f -name "*.h" -exec sed -i'' -e 's/ggml_/ggml_bert_/g' {} +
+
+## stable diffusion
+go-stable-diffusion:
+	git clone --recurse-submodules https://github.com/mudler/go-stable-diffusion go-stable-diffusion
+	cd go-stable-diffusion && git checkout -b build $(STABLEDIFFUSION_VERSION) && git submodule update --init --recursive --depth 1
+
+go-stable-diffusion/libstablediffusion.a:
+	$(MAKE) -C go-stable-diffusion libstablediffusion.a
 
 ## RWKV
 go-rwkv:
@@ -94,7 +111,7 @@ go-bert/libgobert.a: go-bert
 	$(MAKE) -C go-bert libgobert.a
 
 gpt4all/gpt4all-bindings/golang/libgpt4all.a: gpt4all
-	$(MAKE) -C gpt4all/gpt4all-bindings/golang/ $(GENERIC_PREFIX)libgpt4all.a
+	$(MAKE) -C gpt4all/gpt4all-bindings/golang/ libgpt4all.a
 
 ## CEREBRAS GPT
 go-gpt2: 
@@ -113,11 +130,14 @@ go-gpt2:
 	@find ./go-gpt2 -type f -name "*.cpp" -exec sed -i'' -e 's/json_/json_gpt2_/g' {} +
 
 go-gpt2/libgpt2.a: go-gpt2
-	$(MAKE) -C go-gpt2 $(GENERIC_PREFIX)libgpt2.a
+	$(MAKE) -C go-gpt2 libgpt2.a
 
 whisper.cpp:
 	git clone https://github.com/ggerganov/whisper.cpp.git
 	cd whisper.cpp && git checkout -b build $(WHISPER_CPP_VERSION) && git submodule update --init --recursive --depth 1
+	@find ./whisper.cpp -type f -name "*.c" -exec sed -i'' -e 's/ggml_/ggml_whisper_/g' {} +
+	@find ./whisper.cpp -type f -name "*.cpp" -exec sed -i'' -e 's/ggml_/ggml_whisper_/g' {} +
+	@find ./whisper.cpp -type f -name "*.h" -exec sed -i'' -e 's/ggml_/ggml_whisper_/g' {} +
 
 whisper.cpp/libwhisper.a: whisper.cpp
 	cd whisper.cpp && make libwhisper.a
@@ -127,18 +147,19 @@ go-llama:
 	cd go-llama && git checkout -b build $(GOLLAMA_VERSION) && git submodule update --init --recursive --depth 1
 
 go-llama/libbinding.a: go-llama 
-	$(MAKE) -C go-llama $(GENERIC_PREFIX)libbinding.a
+	$(MAKE) -C go-llama BUILD_TYPE=$(BUILD_TYPE) libbinding.a
 
 replace:
 	$(GOCMD) mod edit -replace github.com/go-skynet/go-llama.cpp=$(shell pwd)/go-llama
-	$(GOCMD) mod edit -replace github.com/nomic/gpt4all/gpt4all-bindings/golang=$(shell pwd)/gpt4all/gpt4all-bindings/golang
+	$(GOCMD) mod edit -replace github.com/nomic-ai/gpt4all/gpt4all-bindings/golang=$(shell pwd)/gpt4all/gpt4all-bindings/golang
 	$(GOCMD) mod edit -replace github.com/go-skynet/go-gpt2.cpp=$(shell pwd)/go-gpt2
 	$(GOCMD) mod edit -replace github.com/donomii/go-rwkv.cpp=$(shell pwd)/go-rwkv
 	$(GOCMD) mod edit -replace github.com/ggerganov/whisper.cpp=$(shell pwd)/whisper.cpp
 	$(GOCMD) mod edit -replace github.com/go-skynet/go-bert.cpp=$(shell pwd)/go-bert
 	$(GOCMD) mod edit -replace github.com/go-skynet/bloomz.cpp=$(shell pwd)/bloomz
+	$(GOCMD) mod edit -replace github.com/mudler/go-stable-diffusion=$(shell pwd)/go-stable-diffusion
 
-prepare-sources: go-llama go-gpt2 gpt4all go-rwkv whisper.cpp go-bert bloomz replace
+prepare-sources: go-llama go-gpt2 gpt4all go-rwkv whisper.cpp go-bert bloomz go-stable-diffusion replace
 	$(GOCMD) mod download
 
 ## GENERIC
@@ -148,19 +169,22 @@ rebuild: ## Rebuilds the project
 	$(MAKE) -C go-gpt2 clean
 	$(MAKE) -C go-rwkv clean
 	$(MAKE) -C whisper.cpp clean
+	$(MAKE) -C go-stable-diffusion clean
 	$(MAKE) -C go-bert clean
 	$(MAKE) -C bloomz clean
 	$(MAKE) build
 
-prepare: prepare-sources gpt4all/gpt4all-bindings/golang/libgpt4all.a go-llama/libbinding.a go-bert/libgobert.a go-gpt2/libgpt2.a go-rwkv/librwkv.a whisper.cpp/libwhisper.a bloomz/libbloomz.a  ## Prepares for building
+prepare: prepare-sources gpt4all/gpt4all-bindings/golang/libgpt4all.a $(OPTIONAL_TARGETS) go-llama/libbinding.a go-bert/libgobert.a go-gpt2/libgpt2.a go-rwkv/librwkv.a whisper.cpp/libwhisper.a bloomz/libbloomz.a  ## Prepares for building
 
 clean: ## Remove build related file
 	rm -fr ./go-llama
 	rm -rf ./gpt4all
+	rm -rf ./go-stable-diffusion
 	rm -rf ./go-gpt2
 	rm -rf ./go-rwkv
 	rm -rf ./go-bert
 	rm -rf ./bloomz
+	rm -rf ./whisper.cpp
 	rm -rf $(BINARY_NAME)
 
 ## Build:
@@ -168,14 +192,15 @@ clean: ## Remove build related file
 build: prepare ## Build the project
 	$(info ${GREEN}I local-ai build info:${RESET})
 	$(info ${GREEN}I BUILD_TYPE: ${YELLOW}$(BUILD_TYPE)${RESET})
-	C_INCLUDE_PATH=${C_INCLUDE_PATH} LIBRARY_PATH=${LIBRARY_PATH} $(GOCMD) build -x -o $(BINARY_NAME) ./
+	$(info ${GREEN}I GO_TAGS: ${YELLOW}$(GO_TAGS)${RESET})
+	CGO_LDFLAGS="$(CGO_LDFLAGS)" C_INCLUDE_PATH=${C_INCLUDE_PATH} LIBRARY_PATH=${LIBRARY_PATH} $(GOCMD) build -tags "$(GO_TAGS)" -x -o $(BINARY_NAME) ./
 
 generic-build: ## Build the project using generic
 	BUILD_TYPE="generic" $(MAKE) build
 
 ## Run
 run: prepare ## run local-ai
-	C_INCLUDE_PATH=${C_INCLUDE_PATH} LIBRARY_PATH=${LIBRARY_PATH} $(GOCMD) run ./main.go
+	CGO_LDFLAGS="$(CGO_LDFLAGS)" C_INCLUDE_PATH=${C_INCLUDE_PATH} LIBRARY_PATH=${LIBRARY_PATH} $(GOCMD) run ./main.go
 
 test-models/testmodel:
 	mkdir test-models
@@ -184,11 +209,13 @@ test-models/testmodel:
 	wget https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin -O test-models/whisper-en
 	wget https://huggingface.co/skeskinen/ggml/resolve/main/all-MiniLM-L6-v2/ggml-model-q4_0.bin -O test-models/bert
 	wget https://cdn.openai.com/whisper/draft-20220913a/micro-machines.wav -O test-dir/audio.wav
-	cp tests/fixtures/* test-models
+	wget https://huggingface.co/imxcstar/rwkv-4-raven-ggml/resolve/main/RWKV-4-Raven-1B5-v11-Eng99%25-Other1%25-20230425-ctx4096-16_Q4_2.bin -O test-models/rwkv
+	wget https://raw.githubusercontent.com/saharNooby/rwkv.cpp/5eb8f09c146ea8124633ab041d9ea0b1f1db4459/rwkv/20B_tokenizer.json -O test-models/rwkv.tokenizer.json
+	cp tests/models_fixtures/* test-models
 
 test: prepare test-models/testmodel
-	cp tests/fixtures/* test-models
-	@C_INCLUDE_PATH=${C_INCLUDE_PATH} LIBRARY_PATH=${LIBRARY_PATH} TEST_DIR=$(abspath ./)/test-dir/ CONFIG_FILE=$(abspath ./)/test-models/config.yaml MODELS_PATH=$(abspath ./)/test-models $(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo -v -r ./api
+	cp tests/models_fixtures/* test-models
+	C_INCLUDE_PATH=${C_INCLUDE_PATH} LIBRARY_PATH=${LIBRARY_PATH} TEST_DIR=$(abspath ./)/test-dir/ FIXTURES=$(abspath ./)/tests/fixtures CONFIG_FILE=$(abspath ./)/test-models/config.yaml MODELS_PATH=$(abspath ./)/test-models $(GOCMD) run github.com/onsi/ginkgo/v2/ginkgo -v -r ./api ./pkg
 
 ## Help:
 help: ## Show this help.
