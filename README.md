@@ -173,10 +173,10 @@ docker-compose up -d --pull always
 curl http://localhost:8080/v1/models
 # {"object":"list","data":[{"id":"your-model.bin","object":"model"}]}
 
-curl http://localhost:8080/v1/completions -H "Content-Type: application/json" -d '{
-     "model": "your-model.bin",            
-     "prompt": "A long time ago in a galaxy far, far away",
-     "temperature": 0.7
+curl http://78.47.99.169:8080/v1/completions --user user:password -H "Content-Type: application/json" -d '{
+     "model": "Wizard-Vicuna-13B-Uncensored.ggmlv3.q4_0.bin",            
+     "prompt": "### Instruction: Wie kann ich mit KI Dienstleistungen Geld verdienen? ### Response:",
+     "temperature": 0.2
    }'
 ```
 
