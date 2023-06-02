@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"embed"
 
 	model "github.com/go-skynet/LocalAI/pkg/model"
 )
@@ -15,7 +16,12 @@ type Option struct {
 	debug, disableMessage           bool
 	imageDir                        string
 	cors                            bool
+	preloadJSONModels               string
+	preloadModelsFromPath           string
 	corsAllowOrigins                string
+
+	backendAssets     embed.FS
+	assetsDestination string
 }
 
 type AppOption func(*Option)
@@ -47,12 +53,35 @@ func WithCorsAllowOrigins(b string) AppOption {
 	}
 }
 
+func WithBackendAssetsOutput(out string) AppOption {
+	return func(o *Option) {
+		o.assetsDestination = out
+	}
+}
+
+func WithBackendAssets(f embed.FS) AppOption {
+	return func(o *Option) {
+		o.backendAssets = f
+	}
+}
+
 func WithContext(ctx context.Context) AppOption {
 	return func(o *Option) {
 		o.context = ctx
 	}
 }
 
+func WithYAMLConfigPreload(configFile string) AppOption {
+	return func(o *Option) {
+		o.preloadModelsFromPath = configFile
+	}
+}
+
+func WithJSONStringPreload(configFile string) AppOption {
+	return func(o *Option) {
+		o.preloadJSONModels = configFile
+	}
+}
 func WithConfigFile(configFile string) AppOption {
 	return func(o *Option) {
 		o.configFile = configFile

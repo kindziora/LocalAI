@@ -114,7 +114,8 @@ var _ = Describe("API test", func() {
 			modelLoader = model.NewModelLoader(tmpdir)
 			c, cancel = context.WithCancel(context.Background())
 
-			app = App(WithContext(c), WithModelLoader(modelLoader))
+			app, err = App(WithContext(c), WithModelLoader(modelLoader))
+			Expect(err).ToNot(HaveOccurred())
 			go app.Listen("127.0.0.1:9090")
 
 			defaultConfig := openai.DefaultConfig("")
@@ -198,7 +199,9 @@ var _ = Describe("API test", func() {
 			modelLoader = model.NewModelLoader(os.Getenv("MODELS_PATH"))
 			c, cancel = context.WithCancel(context.Background())
 
-			app = App(WithContext(c), WithModelLoader(modelLoader))
+			var err error
+			app, err = App(WithContext(c), WithModelLoader(modelLoader))
+			Expect(err).ToNot(HaveOccurred())
 			go app.Listen("127.0.0.1:9090")
 
 			defaultConfig := openai.DefaultConfig("")
@@ -254,7 +257,7 @@ var _ = Describe("API test", func() {
 		It("returns errors", func() {
 			_, err := client.CreateCompletion(context.TODO(), openai.CompletionRequest{Model: "foomodel", Prompt: "abcdedfghikl"})
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("error, status code: 500, message: could not load model - all backends returned error: 12 errors occurred:"))
+			Expect(err.Error()).To(ContainSubstring("error, status code: 500, message: could not load model - all backends returned error: 10 errors occurred:"))
 		})
 		It("transcribes audio", func() {
 			if runtime.GOOS != "linux" {
@@ -316,7 +319,9 @@ var _ = Describe("API test", func() {
 			modelLoader = model.NewModelLoader(os.Getenv("MODELS_PATH"))
 			c, cancel = context.WithCancel(context.Background())
 
-			app = App(WithContext(c), WithModelLoader(modelLoader), WithConfigFile(os.Getenv("CONFIG_FILE")))
+			var err error
+			app, err = App(WithContext(c), WithModelLoader(modelLoader), WithConfigFile(os.Getenv("CONFIG_FILE")))
+			Expect(err).ToNot(HaveOccurred())
 			go app.Listen("127.0.0.1:9090")
 
 			defaultConfig := openai.DefaultConfig("")
